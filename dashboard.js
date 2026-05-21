@@ -13,6 +13,22 @@ const rowsPerPage = 15;
 let currentMachineId = "";
 let currentPasscode = "";
 
+const ESP32_IP = 'http://hejaaz.local';
+let currentEptIp = localStorage.getItem('hejaaz_esp32_ip') || ESP32_IP;
+let localStatusInterval;
+let localStatus = null;
+let localLatestRecord = null;
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     // Get local date properly
     const d = new Date();
@@ -62,7 +78,11 @@ async function handleLogin() {
         
         // Start auto-refresh
         if (refreshInterval) clearInterval(refreshInterval);
+        if (localStatusInterval) clearInterval(localStatusInterval);
         refreshInterval = setInterval(fetchData, 5000);
+        localStatusInterval = setInterval(fetchLocalStatus, 2000);
+        setTimeout(loadFanSchedule, 1000);
+        fetchLocalStatus();
     } else {
         btn.innerText = "Connect to AWS";
         btn.disabled = false;
@@ -71,7 +91,121 @@ async function handleLogin() {
     }
 }
 
+function getCloudMaxCycle() {
+    return allData.reduce((max, item) => Math.max(max, parseInt(item.daily_cycles || item.cumulative_cycles || 0, 10) || 0), 0);
+}
+
+function formatLocalTimestamp(epochSeconds, cycleNumber) {
+    const ts = Number(epochSeconds) || 0;
+    if (ts <= 1600000000) return `LOCAL_CYCLE_${cycleNumber || 0}`;
+    const d = new Date(ts * 1000);
+    const pad = value => String(value).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function buildLocalRecord(data) {
+    const cycleNumber = parseInt(data.last_cycle || data.cycles || 0, 10) || 0;
+    if (cycleNumber <= 0) return null;
+    return {
+        timestamp: formatLocalTimestamp(data.last_timestamp, cycleNumber),
+        active_sec: parseFloat(data.last_active_sec || 0) || 0,
+        idle_sec: parseFloat(data.last_idle_sec || 0) || 0,
+        daily_cycles: cycleNumber,
+        rtc_ok: data.rtc_ok,
+        sd_ok: data.sd_ok,
+        source: 'ESP32 Local'
+    };
+}
+
+function updateLocalStatusOnDashboard() {
+    if (!localStatus) return;
+
+    const localCycles = parseInt(localStatus.cycles || 0, 10) || 0;
+    const cloudMaxCycle = getCloudMaxCycle();
+    const queuedRecords = parseInt(localStatus.queued_records || 0, 10) || 0;
+    const timeOk = localStatus.time_ok === true || localStatus.time_ok === 'true';
+    const tlsTimeOk = localStatus.tls_time_ok === true || localStatus.tls_time_ok === 'true';
+    const mqttState = (localStatus.mqtt_state_text || 'offline').toString().replace(/_/g, ' ');
+    const cyclesEl = document.getElementById('cyclesToday');
+    const awsSpan = document.getElementById('awsStatusIndicator');
+    const rtcSpan = document.getElementById('rtcStatusIndicator');
+    const sdSpan = document.getElementById('sdStatusIndicator');
+    const lastUpd = document.getElementById('lastUpdate');
+    const recordCount = document.getElementById('recordCount');
+
+    if (cyclesEl && localCycles > cloudMaxCycle) {
+        cyclesEl.innerText = localCycles;
+    }
+
+    if (awsSpan) {
+        const awsConnected = localStatus.aws_connected === true || localStatus.aws_connected === 'true';
+        awsSpan.innerText = awsConnected ? 'AWS: Syncing' : `AWS: ${mqttState}`;
+        awsSpan.style.color = awsConnected ? '#4CAF50' : '#f59e0b';
+    }
+
+    if (rtcSpan && localStatus.rtc_ok !== undefined) {
+        const rtcOk = localStatus.rtc_ok === true || localStatus.rtc_ok === 'true';
+        rtcSpan.innerText = rtcOk ? 'RTC: OK' : 'RTC: ERR';
+        rtcSpan.style.color = rtcOk ? '#4CAF50' : '#ef4444';
+    }
+
+    if (sdSpan && localStatus.sd_ok !== undefined) {
+        const sdOk = localStatus.sd_ok === true || localStatus.sd_ok === 'true';
+        sdSpan.innerText = sdOk ? 'SD: OK' : 'SD: ERR';
+        sdSpan.style.color = sdOk ? '#4CAF50' : '#ef4444';
+    }
+
+    if (lastUpd && !timeOk) {
+        lastUpd.innerText = 'Waiting for RTC/NTP time';
+    } else if (lastUpd && !tlsTimeOk) {
+        lastUpd.innerText = 'Waiting for AWS TLS time';
+    } else if (lastUpd && queuedRecords > 0) {
+        lastUpd.innerText = `${queuedRecords} record(s) queued for AWS`;
+    } else if (lastUpd && localCycles > cloudMaxCycle) {
+        lastUpd.innerText = `Local cycle #${localCycles} waiting for AWS`;
+    }
+
+    if (recordCount && (localCycles > cloudMaxCycle || queuedRecords > 0)) {
+        recordCount.innerText = `(${filteredData.length} AWS records, local #${localCycles}, queued ${queuedRecords})`;
+    }
+}
+
+let isFetchingLocal = false;
+async function fetchLocalStatus() {
+    if (isFetchingLocal) return;
+    isFetchingLocal = true;
+    try {
+        const response = await fetchWithTimeout(currentEptIp + '/', { cache: 'no-store' }, 3000);
+        if (!response.ok) throw new Error('ESP32 status unavailable');
+        localStatus = await response.json();
+        
+        if (localStatus.local_ip && !currentEptIp.includes(localStatus.local_ip)) {
+            const newIp = 'http://' + localStatus.local_ip;
+            if (newIp !== currentEptIp) {
+                console.log("Updating ESP32 IP to: " + newIp);
+                currentEptIp = newIp;
+                localStorage.setItem('hejaaz_esp32_ip', currentEptIp);
+            }
+        }
+
+        localLatestRecord = buildLocalRecord(localStatus);
+        updateLocalStatusOnDashboard();
+        renderTable();
+    } catch (e) {
+        localStatus = null;
+        localLatestRecord = null;
+        renderTable();
+    } finally {
+        isFetchingLocal = false;
+    }
+}
+
+
+
+let isFetchingCloud = false;
 async function fetchData() {
+    if (isFetchingCloud) return false;
+    isFetchingCloud = true;
     const url = `${BASE_API_URL}?id=${encodeURIComponent(currentMachineId)}&code=${encodeURIComponent(currentPasscode)}`;
     const refreshBtn = document.querySelector('.btn-refresh');
     if(refreshBtn) refreshBtn.innerText = "↻ Syncing...";
@@ -82,6 +216,7 @@ async function fetchData() {
         if (response.status === 401 || response.status === 500) {
             const errorData = await response.json();
             if(refreshBtn) refreshBtn.innerText = "↻ Refresh";
+            isFetchingCloud = false;
             return errorData.error || "Authentication Failed";
         }
         
@@ -91,11 +226,13 @@ async function fetchData() {
         updateDashboard(false); // Do not reset page when auto-syncing
         if(refreshBtn) refreshBtn.innerText = "✓ Synced";
         setTimeout(() => { if(refreshBtn) refreshBtn.innerText = "↻ Refresh"; }, 2000);
+        isFetchingCloud = false;
         return true;
     } catch (e) {
         console.error("Fetch Error:", e);
         if(refreshBtn) refreshBtn.innerText = "⚠ Error";
         setTimeout(() => { if(refreshBtn) refreshBtn.innerText = "↻ Refresh"; }, 2000);
+        isFetchingCloud = false;
         return false;
     }
 }
@@ -104,10 +241,13 @@ function logout() {
     localStorage.removeItem('hejaaz_id');
     localStorage.removeItem('hejaaz_code');
     if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
+    if (localStatusInterval) { clearInterval(localStatusInterval); localStatusInterval = null; }
     currentMachineId = '';
     currentPasscode = '';
     allData = [];
     filteredData = [];
+    localStatus = null;
+    localLatestRecord = null;
     location.reload();
 }
 
@@ -261,8 +401,14 @@ function renderTable() {
     const tbody = document.getElementById('tableBody');
     tbody.innerHTML = "";
     
+    const cloudMaxCycle = getCloudMaxCycle();
+    const displayData = [...filteredData];
+    if (localLatestRecord && (parseInt(localLatestRecord.daily_cycles || 0, 10) || 0) > cloudMaxCycle) {
+        displayData.push(localLatestRecord);
+    }
+    
     // Sort descending by timestamp so newest is on top
-    const displayData = [...filteredData].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+    displayData.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
     
     const startIndex = (currentPage - 1) * rowsPerPage;
     const pageData = displayData.slice(startIndex, startIndex + rowsPerPage);
@@ -276,7 +422,7 @@ function renderTable() {
                 <td>${parseFloat(item.active_sec || 0).toFixed(2)}s</td>
                 <td>${parseFloat(item.idle_sec || 0).toFixed(1)}s</td>
                 <td>#${item.daily_cycles || '-'}</td>
-                <td><span class="source-badge">AWS Cloud</span></td>
+                <td><span class="source-badge">${item.source || 'AWS Cloud'}</span></td>
             </tr>`;
         });
     }
@@ -290,9 +436,10 @@ function renderTable() {
 }
 
 function prevPage() { if (currentPage > 1) { currentPage--; renderTable(); } }
-function nextPage() { 
-    const totalPages = Math.ceil(filteredData.length / rowsPerPage) || 1;
-    if (currentPage < totalPages) { currentPage++; renderTable(); } 
+function nextPage() {
+    const hasLocalRow = localLatestRecord && ((parseInt(localLatestRecord.daily_cycles || 0, 10) || 0) > getCloudMaxCycle());
+    const totalPages = Math.ceil((filteredData.length + (hasLocalRow ? 1 : 0)) / rowsPerPage) || 1;
+    if (currentPage < totalPages) { currentPage++; renderTable(); }
 }
 
 // ==========================================
@@ -358,6 +505,7 @@ async function executeMasterReset() {
 
     // Stop auto-refresh so old data doesn't reload
     if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
+    if (localStatusInterval) { clearInterval(localStatusInterval); localStatusInterval = null; }
 
     statusEl.style.display = 'block';
     statusEl.style.color = '#f59e0b';
@@ -365,8 +513,13 @@ async function executeMasterReset() {
 
     try {
         // Use GET with action parameter
+        const deviceUrl = `${currentEptIp}/reset?code=${encodeURIComponent(code)}`;
         const url = `${BASE_API_URL}?id=${encodeURIComponent(currentMachineId)}&code=${encodeURIComponent(currentPasscode)}&action=master_reset`;
-        const response = await fetch(url);
+        
+        const [cloudResult, deviceResult] = await Promise.allSettled([
+            fetch(url),
+            fetchWithTimeout(deviceUrl, { cache: 'no-store' }, 5000)
+        ]);
 
         // Clear dashboard immediately
         allData = [];
@@ -377,9 +530,15 @@ async function executeMasterReset() {
         document.getElementById('totalIdleDay').innerText = '0s';
         document.getElementById('recordCount').innerText = '(0 records)';
 
-        if (response.ok) {
+        const cloudOk = cloudResult.status === 'fulfilled' && cloudResult.value.ok;
+        const deviceOk = deviceResult.status === 'fulfilled' && deviceResult.value.ok;
+
+        if (cloudOk && deviceOk) {
             statusEl.style.color = '#4CAF50';
-            statusEl.innerText = '✓ ALL DATA WIPED SUCCESSFULLY! Restart the dashboard to verify.';
+            statusEl.innerText = '✓ ALL DATA WIPED SUCCESSFULLY! ESP32 reset. Restart the dashboard to verify.';
+        } else if (cloudOk) {
+            statusEl.style.color = '#f59e0b';
+            statusEl.innerText = 'AWS data wiped. ESP32 local reset failed.';
         } else {
             statusEl.style.color = '#f59e0b';
             statusEl.innerText = 'AWS delete may not be supported. Update your Lambda function (see instructions).';
@@ -389,6 +548,10 @@ async function executeMasterReset() {
             document.getElementById('masterResetPanel').style.display = 'none';
             statusEl.style.display = 'none';
             document.getElementById('resetPasscode').value = '';
+            fetchData();
+            fetchLocalStatus();
+            refreshInterval = setInterval(fetchData, 5000);
+            localStatusInterval = setInterval(fetchLocalStatus, 2000);
         }, 5000);
     } catch (e) {
         statusEl.style.color = '#ef4444';
@@ -397,4 +560,50 @@ async function executeMasterReset() {
         filteredData = [];
         updateDashboard(true);
     }
+}
+
+// ==========================================
+// FAN SCHEDULE (communicates with ESP32 WebServer)
+// ==========================================
+async function loadFanSchedule() {
+    try {
+        const resp = await fetchWithTimeout(currentEptIp + '/getfan', {}, 3000);
+        const data = await resp.json();
+        document.getElementById('fanEnabled').checked = data.enabled;
+        document.getElementById('fanStart').value = String(data.sh).padStart(2, '0') + ':' + String(data.sm).padStart(2, '0');
+        document.getElementById('fanEnd').value = String(data.eh).padStart(2, '0') + ':' + String(data.em).padStart(2, '0');
+    } catch (e) { console.log('ESP32 not reachable for fan schedule'); }
+}
+
+async function saveFanSchedule() {
+    const enabled = document.getElementById('fanEnabled').checked ? '1' : '0';
+    const start = document.getElementById('fanStart').value.split(':');
+    const end = document.getElementById('fanEnd').value.split(':');
+    const statusEl = document.getElementById('fanStatus');
+
+    if (!start[0] || !end[0]) {
+        showFanStatus('Please select time', '#ef4444');
+        return;
+    }
+
+    try {
+        await fetchWithTimeout(`${currentEptIp}/setfan?enabled=${enabled}&sh=${start[0]}&sm=${start[1]}&eh=${end[0]}&em=${end[1]}`, {}, 3000);
+        showFanStatus('Settings saved to EEPROM', '#4CAF50');
+    } catch (e) {
+        showFanStatus('Error: ESP32 unreachable', '#ef4444');
+    }
+}
+
+function showFanStatus(msg, color) {
+    const statusEl = document.getElementById('fanStatus');
+    statusEl.innerText = msg;
+    statusEl.style.color = color;
+    statusEl.style.display = 'block';
+    statusEl.className = 'save-message'; // Triggers animation
+
+    // Reset after animation finishes
+    setTimeout(() => {
+        statusEl.style.display = 'none';
+        statusEl.className = '';
+    }, 3000);
 }
